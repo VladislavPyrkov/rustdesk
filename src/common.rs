@@ -2351,6 +2351,7 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
 }
 
 pub fn load_custom_client() {
+    apply_custom_client_data(PROSTO_CUSTOM_CLIENT.as_bytes());
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2462,8 +2463,23 @@ pub fn read_custom_client(config: &str) {
         log::error!("Failed to dec custom client config");
         return;
     };
+    apply_custom_client_data(&data);
+}
+
+// ПРО.СТО Remote: built-in (unsigned) branding and server settings.
+// Change host/key here to move to another server, then rebuild.
+const PROSTO_CUSTOM_CLIENT: &str = r#"{
+  "app-name": "ProstoRemote",
+  "default-settings": {
+    "custom-rendezvous-server": "rd.prostoobr.ru",
+    "relay-server": "rd.prostoobr.ru",
+    "key": "GPNx7jI4sh3fr8+RaJmh8Rrah4IaMM+xyVGl0N6i128="
+  }
+}"#;
+
+fn apply_custom_client_data(data: &[u8]) {
     let Ok(mut data) =
-        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
+        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(data)
     else {
         log::error!("Failed to parse custom client config");
         return;
