@@ -3021,7 +3021,8 @@ int versionCmp(String v1, String v2) {
 }
 
 String getWindowName({WindowType? overrideType}) {
-  final name = bind.mainGetAppNameSync();
+  final internalName = bind.mainGetAppNameSync();
+  final name = internalName == 'ProstoRemote' ? 'ПРО.СТО Remote' : internalName;
   switch (overrideType ?? kWindowType) {
     case WindowType.Main:
       return name;
