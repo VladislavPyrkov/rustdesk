@@ -60,6 +60,13 @@ fn make_tray() -> hbb_common::ResultType<()> {
     };
     let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height)
         .context("Failed to open icon")?;
+    // ПРО.СТО Remote: theme-aware tray icons (dark/light taskbar, idle/active).
+    #[cfg(windows)]
+    let mut tray_state = (taskbar_is_light(), false);
+    #[cfg(windows)]
+    let icon = load_tray_icon(tray_state.0, tray_state.1).unwrap_or(icon);
+    #[cfg(windows)]
+    let mut last_theme_check = std::time::Instant::now();
 
     let mut event_loop = EventLoopBuilder::new().build();
 
@@ -247,6 +254,20 @@ fn make_tray() -> hbb_common::ResultType<()> {
         }
 
         #[cfg(windows)]
+        if last_theme_check.elapsed() > std::time::Duration::from_secs(3) {
+            last_theme_check = std::time::Instant::now();
+            let light = taskbar_is_light();
+            if light != tray_state.0 {
+                tray_state.0 = light;
+                if let Some(new_icon) = load_tray_icon(light, tray_state.1) {
+                    _tray_icon.lock().unwrap().as_mut().map(|t| {
+                        let _ = t.set_icon(Some(new_icon));
+                    });
+                }
+            }
+        }
+
+        #[cfg(windows)]
         if let Ok(data) = ipc_receiver.try_recv() {
             match data {
                 Data::ControlledSessionCount(count) => {
@@ -255,11 +276,74 @@ fn make_tray() -> hbb_common::ResultType<()> {
                         .unwrap()
                         .as_mut()
                         .map(|t| t.set_tooltip(Some(tooltip(count))));
+                    let active = count > 0;
+                    if tray_state.1 != active {
+                        tray_state.1 = active;
+                        if let Some(new_icon) = load_tray_icon(tray_state.0, active) {
+                            _tray_icon.lock().unwrap().as_mut().map(|t| {
+                                let _ = t.set_icon(Some(new_icon));
+                            });
+                        }
+                    }
                 }
                 _ => {}
             }
         }
     });
+}
+
+#[cfg(windows)]
+fn taskbar_is_light() -> bool {
+    use winreg::{enums::*, RegKey};
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|k| k.get_value::<u32, _>("SystemUsesLightTheme"))
+        .map(|v| v == 1)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn tray_icon_frame(theme: &str, state: &str, size: u32) -> &'static [u8] {
+    match (theme, state, size) {
+        ("dark", "idle", 16) => include_bytes!("../res/tray/dark-idle-16.png"),
+        ("dark", "idle", 20) => include_bytes!("../res/tray/dark-idle-20.png"),
+        ("dark", "idle", 24) => include_bytes!("../res/tray/dark-idle-24.png"),
+        ("dark", "idle", 32) => include_bytes!("../res/tray/dark-idle-32.png"),
+        ("dark", "active", 16) => include_bytes!("../res/tray/dark-active-16.png"),
+        ("dark", "active", 20) => include_bytes!("../res/tray/dark-active-20.png"),
+        ("dark", "active", 24) => include_bytes!("../res/tray/dark-active-24.png"),
+        ("dark", "active", 32) => include_bytes!("../res/tray/dark-active-32.png"),
+        ("light", "idle", 16) => include_bytes!("../res/tray/light-idle-16.png"),
+        ("light", "idle", 20) => include_bytes!("../res/tray/light-idle-20.png"),
+        ("light", "idle", 24) => include_bytes!("../res/tray/light-idle-24.png"),
+        ("light", "idle", 32) => include_bytes!("../res/tray/light-idle-32.png"),
+        ("light", "active", 16) => include_bytes!("../res/tray/light-active-16.png"),
+        ("light", "active", 20) => include_bytes!("../res/tray/light-active-20.png"),
+        ("light", "active", 24) => include_bytes!("../res/tray/light-active-24.png"),
+        ("light", "active", 32) => include_bytes!("../res/tray/light-active-32.png"),
+        _ => include_bytes!("../res/tray/dark-idle-32.png"),
+    }
+}
+
+#[cfg(windows)]
+fn load_tray_icon(light: bool, active: bool) -> Option<tray_icon::Icon> {
+    let px = unsafe { winapi::um::winuser::GetSystemMetrics(winapi::um::winuser::SM_CXSMICON) };
+    let size = if px <= 16 {
+        16
+    } else if px <= 20 {
+        20
+    } else if px <= 24 {
+        24
+    } else {
+        32
+    };
+    let theme = if light { "light" } else { "dark" };
+    let state = if active { "active" } else { "idle" };
+    let image = image::load_from_memory(tray_icon_frame(theme, state, size))
+        .ok()?
+        .into_rgba8();
+    let (w, h) = image.dimensions();
+    tray_icon::Icon::from_rgba(image.into_raw(), w, h).ok()
 }
 
 #[cfg(windows)]
