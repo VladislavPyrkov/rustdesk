@@ -296,7 +296,7 @@ fn make_tray() -> hbb_common::ResultType<()> {
 fn taskbar_is_light() -> bool {
     use winreg::{enums::*, RegKey};
     RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey("Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
         .and_then(|k| k.get_value::<u32, _>("SystemUsesLightTheme"))
         .map(|v| v == 1)
         .unwrap_or(false)
