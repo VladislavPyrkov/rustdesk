@@ -2362,6 +2362,19 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
 
 pub fn load_custom_client() {
     apply_custom_client_data(PROSTO_CUSTOM_CLIENT.as_bytes());
+    // School network: use the HTTP proxy by default, but only when it is reachable,
+    // so the same build keeps working outside the school.
+    if std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([10, 0, 65, 52], 3128)),
+        std::time::Duration::from_millis(500),
+    )
+    .is_ok()
+    {
+        config::DEFAULT_SETTINGS
+            .write()
+            .unwrap()
+            .insert("proxy-url".to_owned(), "http://10.0.65.52:3128".to_owned());
+    }
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
