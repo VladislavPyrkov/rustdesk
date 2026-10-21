@@ -1,0 +1,40 @@
+name: ProstoRemote server (hbbs with TCP registration)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-hbbs:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout this repo (patch)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: ours
+
+      - name: Checkout rustdesk-server 1.1.16
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rustdesk/rustdesk-server
+          ref: 1.1.16
+          submodules: recursive
+          path: server
+
+      - name: Apply patch
+        working-directory: server
+        run: git apply --check ../ours/prosto-server/hbbs-tcp-register.patch && git apply ../ours/prosto-server/hbbs-tcp-register.patch
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Build hbbs
+        working-directory: server
+        run: cargo build --release --bin hbbs
+
+      - name: Upload hbbs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hbbs-tcp-register-linux-x64
+          path: server/target/release/hbbs

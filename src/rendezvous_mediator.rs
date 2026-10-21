@@ -590,8 +590,13 @@ impl RendezvousMediator {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
-        let key = crate::get_key(true).await;
-        crate::secure_tcp(&mut conn, &key).await?;
+        // ПРО.СТО Remote: when a proxy is configured we register over plain TCP with our patched
+        // hbbs, which does not run the key exchange, so do not wait for it. Without a proxy
+        // the original secured behaviour is kept.
+        if !Config::is_proxy() {
+            let key = crate::get_key(true).await;
+            crate::secure_tcp(&mut conn, &key).await?;
+        }
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
             host: host.clone(),

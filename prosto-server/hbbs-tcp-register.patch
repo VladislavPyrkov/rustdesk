@@ -1,0 +1,259 @@
+diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
+index dff45eb..21f8bab 100644
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -82,6 +82,7 @@ struct Inner {
+ #[derive(Clone)]
+ pub struct RendezvousServer {
+     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
++    tcp_peers: Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>,
+     pm: PeerMap,
+     tx: Sender,
+     relay_servers: Arc<RelayServers>,
+@@ -129,6 +130,7 @@ impl RendezvousServer {
+         };
+         let mut rs = Self {
+             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
++            tcp_peers: Arc::new(Mutex::new(HashMap::new())),
+             pm,
+             tx: tx.clone(),
+             relay_servers: Default::default(),
+@@ -251,7 +253,18 @@ impl RendezvousServer {
+                 }
+                 Some(data) = rx.recv() => {
+                     match data {
+-                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
++                        Data::Msg(msg, addr) => {
++                            // peers registered over TCP (e.g. behind an HTTP proxy) are reached
++                            // through their open connection, everyone else over UDP
++                            let tcp_tx = self.tcp_peers.lock().await.get(&try_into_v4(addr)).cloned();
++                            if let Some(tcp_tx) = tcp_tx {
++                                if let Ok(bytes) = msg.write_to_bytes() {
++                                    tcp_tx.send(Bytes::from(bytes)).ok();
++                                }
++                            } else {
++                                allow_err!(socket.send(msg.as_ref(), addr).await);
++                            }
++                        }
+                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
+                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
+                     }
+@@ -1179,9 +1192,84 @@ impl RendezvousServer {
+         } else {
+             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+             sink = Some(Sink::TcpStream(a));
+-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+-                    break;
++            let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<Bytes>();
++            let mut peer_id: Option<String> = None;
++            let mut heartbeat = interval(Duration::from_secs(15));
++            let mut last_rx = Instant::now();
++            loop {
++                tokio::select! {
++                    res = b.next() => {
++                        let bytes = match res {
++                            Some(Ok(bytes)) => bytes,
++                            _ => break,
++                        };
++                        last_rx = Instant::now();
++                        if let Some(id) = peer_id.as_ref() {
++                            // any traffic (the client echoes our heartbeat) keeps the peer online
++                            self.touch_tcp_peer(id, addr).await;
++                        }
++                        if bytes.is_empty() {
++                            continue;
++                        }
++                        let reg = match RendezvousMessage::parse_from_bytes(&bytes) {
++                            Ok(m) if matches!(
++                                m.union,
++                                Some(rendezvous_message::Union::RegisterPk(_))
++                                    | Some(rendezvous_message::Union::RegisterPeer(_))
++                            ) => Some(m),
++                            _ => None,
++                        };
++                        if let Some(m) = reg {
++                            match self.handle_tcp_register(m, &mut sink, addr, &peer_tx).await {
++                                Ok(Some(id)) => peer_id = Some(id),
++                                Ok(None) => {}
++                                Err(err) => {
++                                    log::error!("tcp register failure: {}", err);
++                                    break;
++                                }
++                            }
++                            continue;
++                        }
++                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
++                            break;
++                        }
++                    }
++                    out = peer_rx.recv() => {
++                        if let Some(out) = out {
++                            if let Some(Sink::TcpStream(s)) = sink.as_mut() {
++                                if s.send(out).await.is_err() {
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    _ = heartbeat.tick() => {
++                        if last_rx.elapsed().as_millis() as i64 > 45_000 {
++                            break;
++                        }
++                        if peer_id.is_some() {
++                            if let Some(Sink::TcpStream(s)) = sink.as_mut() {
++                                if s.send(Bytes::new()).await.is_err() {
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            if let Some(id) = peer_id.take() {
++                let key = try_into_v4(addr);
++                let mut peers = self.tcp_peers.lock().await;
++                if peers
++                    .get(&key)
++                    .map(|t| t.same_channel(&peer_tx))
++                    .unwrap_or(false)
++                {
++                    peers.remove(&key);
++                    drop(peers);
++                    if let Some(peer) = self.pm.get_in_memory(&id).await {
++                        peer.write().await.last_reg_time = get_expired_time();
++                    }
+                 }
+             }
+         }
+@@ -1192,6 +1280,130 @@ impl RendezvousServer {
+         Ok(())
+     }
+ 
++    async fn touch_tcp_peer(&self, id: &str, addr: SocketAddr) {
++        if let Some(peer) = self.pm.get_in_memory(id).await {
++            let mut peer = peer.write().await;
++            peer.socket_addr = addr;
++            peer.last_reg_time = Instant::now();
++        }
++    }
++
++    async fn tcp_rk_res(sink: &mut Option<Sink>, res: register_pk_response::Result) {
++        let mut msg_out = RendezvousMessage::new();
++        msg_out.set_register_pk_response(RegisterPkResponse {
++            result: res.into(),
++            ..Default::default()
++        });
++        Self::send_to_sink(sink, msg_out).await;
++    }
++
++    // Registration over a persistent TCP connection (clients that can only reach the
++    // server through an HTTP proxy cannot use UDP). Mirrors the UDP RegisterPeer and
++    // RegisterPk handling; returns the registered id.
++    async fn handle_tcp_register(
++        &mut self,
++        msg: RendezvousMessage,
++        sink: &mut Option<Sink>,
++        addr: SocketAddr,
++        tx: &mpsc::UnboundedSender<Bytes>,
++    ) -> ResultType<Option<String>> {
++        match msg.union {
++            Some(rendezvous_message::Union::RegisterPeer(rp)) => {
++                if rp.id.is_empty() {
++                    return Ok(None);
++                }
++                let request_pk = if let Some(old) = self.pm.get_in_memory(&rp.id).await {
++                    let mut old = old.write().await;
++                    let ip = addr.ip();
++                    let ip_change = if old.socket_addr.port() != 0 {
++                        ip != old.socket_addr.ip()
++                    } else {
++                        ip.to_string() != old.info.ip
++                    } && !ip.is_loopback();
++                    let request_pk = old.pk.is_empty() || ip_change;
++                    if !request_pk {
++                        old.socket_addr = addr;
++                        old.last_reg_time = Instant::now();
++                    }
++                    request_pk
++                } else {
++                    true
++                };
++                let mut msg_out = RendezvousMessage::new();
++                msg_out.set_register_peer_response(RegisterPeerResponse {
++                    request_pk,
++                    ..Default::default()
++                });
++                Self::send_to_sink(sink, msg_out).await;
++                if !request_pk {
++                    self.tcp_peers
++                        .lock()
++                        .await
++                        .insert(try_into_v4(addr), tx.clone());
++                    return Ok(Some(rp.id));
++                }
++                Ok(None)
++            }
++            Some(rendezvous_message::Union::RegisterPk(rk)) => {
++                if rk.uuid.is_empty() || rk.pk.is_empty() {
++                    return Ok(None);
++                }
++                let id = rk.id;
++                let ip = addr.ip().to_string();
++                if id.len() < 6 {
++                    Self::tcp_rk_res(sink, UUID_MISMATCH).await;
++                    return Ok(None);
++                } else if !self.check_ip_blocker(&ip, &id).await {
++                    Self::tcp_rk_res(sink, TOO_FREQUENT).await;
++                    return Ok(None);
++                }
++                let peer = self.pm.get_or(&id).await;
++                let changed = {
++                    let peer = peer.read().await;
++                    if peer.uuid.is_empty() {
++                        true
++                    } else if peer.uuid == rk.uuid {
++                        if peer.info.ip != ip && peer.pk != rk.pk {
++                            log::warn!("Peer {} ip/pk mismatch (tcp): {}", id, ip);
++                            drop(peer);
++                            Self::tcp_rk_res(sink, UUID_MISMATCH).await;
++                            return Ok(None);
++                        }
++                        peer.pk != rk.pk || peer.info.ip != ip
++                    } else {
++                        log::warn!("Peer {} uuid mismatch (tcp)", id);
++                        drop(peer);
++                        Self::tcp_rk_res(sink, UUID_MISMATCH).await;
++                        return Ok(None);
++                    }
++                };
++                if changed {
++                    let res = self
++                        .pm
++                        .update_pk(id.clone(), peer.clone(), addr, rk.uuid, rk.pk, ip)
++                        .await;
++                    if res != register_pk_response::Result::OK {
++                        Self::tcp_rk_res(sink, res).await;
++                        return Ok(None);
++                    }
++                }
++                {
++                    let mut p = peer.write().await;
++                    p.socket_addr = addr;
++                    p.last_reg_time = Instant::now();
++                }
++                Self::tcp_rk_res(sink, register_pk_response::Result::OK).await;
++                self.tcp_peers
++                    .lock()
++                    .await
++                    .insert(try_into_v4(addr), tx.clone());
++                log::info!("TCP peer registered: {} {:?}", id, addr);
++                Ok(Some(id))
++            }
++            _ => Ok(None),
++        }
++    }
++
+     #[inline]
+     async fn get_pk(&mut self, version: &str, id: String) -> Bytes {
+         if version.is_empty() || self.inner.sk.is_none() {
